@@ -1270,6 +1270,7 @@ void Index<T, TagT, LabelT>::inter_insert(uint32_t n, std::vector<uint32_t> &pru
 
 template <typename T, typename TagT, typename LabelT> void Index<T, TagT, LabelT>::link()
 {
+    diskann::Timer build_timer;
     uint32_t num_threads = _indexingThreads;
     if (num_threads != 0)
         omp_set_num_threads(num_threads);
@@ -1369,6 +1370,7 @@ template <typename T, typename TagT, typename LabelT> void Index<T, TagT, LabelT
     {
         diskann::cout << "done. Link time: " << ((double)link_timer.elapsed() / (double)1000000) << "s" << std::endl;
     }
+    diskann::cout << build_timer.elapsed_seconds_for_step("link") << std::endl;
 }
 
 template <typename T, typename TagT, typename LabelT>
@@ -1578,6 +1580,7 @@ void Index<T, TagT, LabelT>::_build(const DataType &data, const size_t num_point
 template <typename T, typename TagT, typename LabelT>
 void Index<T, TagT, LabelT>::build(const T *data, const size_t num_points_to_load, const std::vector<TagT> &tags)
 {
+    std::cout << "build 1" << std::endl;
     if (num_points_to_load == 0)
     {
         throw ANNException("Do not call build with 0 points", -1, __FUNCSIG__, __FILE__, __LINE__);
@@ -1604,7 +1607,7 @@ template <typename T, typename TagT, typename LabelT>
 void Index<T, TagT, LabelT>::build(const char *filename, const size_t num_points_to_load, const std::vector<TagT> &tags)
 {
     // idealy this should call build_filtered_index based on params passed
-
+    std::cout << "build 2" << std::endl;
     std::unique_lock<std::shared_timed_mutex> ul(_update_lock);
 
     // error checks
@@ -1690,7 +1693,7 @@ template <typename T, typename TagT, typename LabelT>
 void Index<T, TagT, LabelT>::build(const char *filename, const size_t num_points_to_load, const char *tag_filename)
 {
     std::vector<TagT> tags;
-
+    std::cout << "build 3" << std::endl;
     if (_enable_tags)
     {
         std::unique_lock<std::shared_timed_mutex> tl(_tag_lock);
@@ -1729,10 +1732,12 @@ void Index<T, TagT, LabelT>::build(const char *filename, const size_t num_points
     build(filename, num_points_to_load, tags);
 }
 
+//bs: 이게 진짜
 template <typename T, typename TagT, typename LabelT>
 void Index<T, TagT, LabelT>::build(const std::string &data_file, const size_t num_points_to_load,
                                    IndexFilterParams &filter_params)
 {
+    std::cout << "build 4" << std::endl;
     size_t points_to_load = num_points_to_load == 0 ? _max_points : num_points_to_load;
 
     auto s = std::chrono::high_resolution_clock::now();

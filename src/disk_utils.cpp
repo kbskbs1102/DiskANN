@@ -638,6 +638,7 @@ int build_merged_vamana_index(std::string base_file, diskann::Metric compareMetr
     double full_index_ram = estimate_ram_usage(base_num, (uint32_t)base_dim, sizeof(T), R);
 
     // TODO: Make this honest when there is filter support
+    // bs: 메모리 사용량이 메모리 비용보다 적으면 한 번에 빌드
     if (full_index_ram < ram_budget * 1024 * 1024 * 1024)
     {
         diskann::cout << "Full index fits in RAM budget, should consume at most "

@@ -31,8 +31,11 @@ struct QueryStats
     unsigned read_size = 0;    // total # of bytes read
     unsigned n_cmps_saved = 0; // # cmps saved
     unsigned n_cmps = 0;       // # cmps
-    unsigned n_cache_hits = 0; // # cache_hits
     unsigned n_hops = 0;       // # search hops
+
+    unsigned n_cache_hits = 0; // # cache_hits
+    unsigned n_cache_misses = 0; // # cache_misses
+    unsigned bs_hops = 0; // # hops
 };
 
 template <typename T>
@@ -61,5 +64,16 @@ inline double get_mean_stats(QueryStats *stats, uint64_t len, const std::functio
         avg += (double)member_fn(stats[i]);
     }
     return avg / len;
+}
+
+template<typename T>
+inline double get_cache_hit_rate(
+    QueryStats *stats, uint64_t len,
+    const std::function<T(const QueryStats &)> &member_fn) {
+double avg = 0;
+for (uint64_t i = 0; i < len; i++) {
+    avg += (double) member_fn(stats[i]) / (stats[i].n_cache_hits + stats[i].n_cache_misses);
+}
+return avg / len;
 }
 } // namespace diskann

@@ -1264,6 +1264,7 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                        use_reorder_data, stats);
 }
 
+// bs: beam search
 template <typename T, typename LabelT>
 void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t k_search, const uint64_t l_search,
                                                  uint64_t *indices, float *distances, const uint64_t beam_width,
@@ -1440,6 +1441,10 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
             else
             {
                 frontier.push_back(nbr.id);
+                if (stats != nullptr)
+                {
+                    stats->n_cache_misses++;
+                }
             }
             if (this->_count_visited_nodes)
             {
@@ -1533,21 +1538,21 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                 }
             }
         }
-#ifdef USE_BING_INFRA
-        // process each frontier nhood - compute distances to unvisited nodes
-        int completedIndex = -1;
-        long requestCount = static_cast<long>(frontier_read_reqs.size());
-        // If we issued read requests and if a read is complete or there are
-        // reads in wait state, then enter the while loop.
-        while (requestCount > 0 && getNextCompletedRequest(reader, ctx, requestCount, completedIndex))
-        {
-            assert(completedIndex >= 0);
-            auto &frontier_nhood = frontier_nhoods[completedIndex];
-            (*ctx.m_pRequestsStatus)[completedIndex] = IOContext::PROCESS_COMPLETE;
-#else
+// #ifdef USE_BING_INFRA
+//         // process each frontier nhood - compute distances to unvisited nodes
+//         int completedIndex = -1;
+//         long requestCount = static_cast<long>(frontier_read_reqs.size());
+//         // If we issued read requests and if a read is complete or there are
+//         // reads in wait state, then enter the while loop.
+//         while (requestCount > 0 && getNextCompletedRequest(reader, ctx, requestCount, completedIndex))
+//         {
+//             assert(completedIndex >= 0);
+//             auto &frontier_nhood = frontier_nhoods[completedIndex];
+//             (*ctx.m_pRequestsStatus)[completedIndex] = IOContext::PROCESS_COMPLETE;
+// #else
+// #endif
         for (auto &frontier_nhood : frontier_nhoods)
         {
-#endif
             char *node_disk_buf = offset_to_node(frontier_nhood.second, frontier_nhood.first);
             uint32_t *node_buf = offset_to_node_nhood(node_disk_buf);
             uint64_t nnbrs = (uint64_t)(*node_buf);
@@ -1606,7 +1611,10 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                 stats->cpu_us += (float)cpu_timer.elapsed();
             }
         }
-
+        if (stats != nullptr)
+        {
+            stats->bs_hops++;
+        }
         hops++;
     }
 

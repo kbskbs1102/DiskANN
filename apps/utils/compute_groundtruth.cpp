@@ -346,6 +346,8 @@ std::vector<std::vector<std::pair<uint32_t, float>>> processUnfilteredParts(cons
     std::vector<std::vector<std::pair<uint32_t, float>>> res(nqueries);
     for (int p = 0; p < num_parts; p++)
     {
+		std::cout << "---------------------------------------------" << std::endl;
+		std::cout << "parts count = " << p << std::endl;
         size_t start_id = p * PARTSIZE;
         load_bin_as_float<T>(base_file.c_str(), base_data, npoints, dim, p);
 

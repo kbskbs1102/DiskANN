@@ -121,11 +121,19 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
 
     std::vector<uint32_t> node_list;
     diskann::cout << "Caching " << num_nodes_to_cache << " nodes around medoid(s)" << std::endl;
+    
+    // 캐싱하는 부분
+    auto s = std::chrono::high_resolution_clock::now();
     _pFlashIndex->cache_bfs_levels(num_nodes_to_cache, node_list);
-    // if (num_nodes_to_cache > 0)
-    //     _pFlashIndex->generate_cache_list_from_sample_queries(warmup_query_file, 15, 6, num_nodes_to_cache,
-    //     num_threads, node_list);
+    if (num_nodes_to_cache > 0)
+        _pFlashIndex->generate_cache_list_from_sample_queries(warmup_query_file, 15, 6, num_nodes_to_cache,
+        num_threads, node_list);
     _pFlashIndex->load_cache_list(node_list);
+    auto e = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> diff = e - s;
+    double caching_time = diff.count();
+    diskann::cout << "Caching time: " << caching_time << " s" << std::endl;   
+    // 캐싱 끝
     node_list.clear();
     node_list.shrink_to_fit();
 
@@ -179,7 +187,7 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
     std::string recall_string = "Recall@" + std::to_string(recall_at);
     diskann::cout << std::setw(6) << "L" << std::setw(12) << "Beamwidth" << std::setw(16) << "QPS" << std::setw(16)
                   << "Mean Latency" << std::setw(16) << "99.9 Latency" << std::setw(16) << "Mean IOs" << std::setw(16)
-                  << "Mean IO (us)" << std::setw(16) << "CPU (s)";
+                  << "Mean IO (us)" << std::setw(16) << "CPU (s)" << std::setw(16) << "Cache Hit Rate" << std::setw(16) << "Mean BS Hops" << std::setw(16) << "Mean Hit Cnt" ;
     if (calc_recall_flag)
     {
         diskann::cout << std::setw(16) << recall_string << std::endl;
@@ -273,6 +281,17 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
         auto mean_io_us = diskann::get_mean_stats<float>(stats, query_num,
                                                          [](const diskann::QueryStats &stats) { return stats.io_us; });
 
+        auto mean_hops = diskann::get_mean_stats<uint32_t>(stats, query_num,
+                                                          [](const diskann::QueryStats &stats) { return stats.n_hops; });
+
+        auto mean_cache_hit_rate = diskann::get_cache_hit_rate<uint32_t>(stats, query_num,
+                                                                 [](const diskann::QueryStats &stats) { return stats.n_cache_hits; });
+        
+        auto mean_cache_hit_cnt = diskann::get_mean_stats<uint32_t>(stats, query_num,
+                                                              [](const diskann::QueryStats &stats) { return stats.n_cache_hits; });
+        
+        auto mean_bs_hops = diskann::get_mean_stats<uint32_t>(stats, query_num,
+                                                              [](const diskann::QueryStats &stats) { return stats.bs_hops; });
         double recall = 0;
         if (calc_recall_flag)
         {
@@ -283,7 +302,7 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
 
         diskann::cout << std::setw(6) << L << std::setw(12) << optimized_beamwidth << std::setw(16) << qps
                       << std::setw(16) << mean_latency << std::setw(16) << latency_999 << std::setw(16) << mean_ios
-                      << std::setw(16) << mean_io_us << std::setw(16) << mean_cpuus;
+                      << std::setw(16) << mean_io_us << std::setw(16) << mean_cpuus << std::setw(16) << mean_cache_hit_rate << std::setw(16) << mean_bs_hops << std::setw(16) << mean_cache_hit_cnt;
         if (calc_recall_flag)
         {
             diskann::cout << std::setw(16) << recall << std::endl;
