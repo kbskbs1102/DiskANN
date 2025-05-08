@@ -24,6 +24,39 @@ namespace diskann
 template <typename T, typename LabelT = uint32_t> class PQFlashIndex
 {
   public:
+    enum CacheStrategy {
+        BFS,
+        HOT,
+        LFU,
+        LRU,
+        FIFO,
+        RANDOM
+    };
+    unsigned n_cache_full = 0;
+    
+    CacheStrategy _cache_strategy;
+    size_t _max_cache_size;
+
+    // LFU cache 용 자료 구조 (frequency와 노드 ID를 기록)
+    std::unordered_map<uint32_t, uint32_t> _cache_frequency;  // <node_id, frequency>
+
+    // frequency가 같을 때 입력 순서를 비교하기 위한 타임스탬프
+    uint64_t _current_timestamp = 0;
+    std::unordered_map<uint32_t, uint64_t> _entry_timestamp;  // node_id -> 입력 시간
+    // frequency와 timestamp를 기준으로 정렬하는 set으로 변경
+    std::set<std::tuple<uint32_t, uint64_t, uint32_t>> _frequency_set;  // <frequency, timestamp, node_id>
+
+    // LRU 캐시를 위한 자료구조
+    std::list<uint32_t> _lru_list;  // 가장 최근에 사용된 순서대로 노드 ID 저장
+    std::unordered_map<uint32_t, std::list<uint32_t>::iterator> _lru_map;  // 노드 ID -> 리스트 iterator 매핑
+
+    // FIFO 캐시를 위한 자료구조
+    std::queue<uint32_t> _fifo_queue;  // 먼저 들어온 순서대로 노드 ID 저장
+
+    // nhood_cache; the uint32_t in nhood_Cache are offsets into nhood_cache_buf
+    unsigned *_nhood_cache_buf = nullptr;
+    tsl::robin_map<uint32_t, std::pair<uint32_t, uint32_t *>> _nhood_cache;
+
     DISKANN_DLLEXPORT PQFlashIndex(std::shared_ptr<AlignedFileReader> &fileReader,
                                    diskann::Metric metric = diskann::Metric::L2);
     DISKANN_DLLEXPORT ~PQFlashIndex();
@@ -44,6 +77,7 @@ template <typename T, typename LabelT = uint32_t> class PQFlashIndex
                                                    const char *pivots_filepath, const char *compressed_filepath);
 #endif
 
+    DISKANN_DLLEXPORT void load_cache_list(std::vector<uint32_t> &node_list, std::string file_name);
     DISKANN_DLLEXPORT void load_cache_list(std::vector<uint32_t> &node_list);
 
 #ifdef EXEC_ENV_OLS
@@ -60,6 +94,8 @@ template <typename T, typename LabelT = uint32_t> class PQFlashIndex
 
     DISKANN_DLLEXPORT void cache_bfs_levels(uint64_t num_nodes_to_cache, std::vector<uint32_t> &node_list,
                                             const bool shuffle = false);
+
+    DISKANN_DLLEXPORT void cache_random_nodes(uint64_t num_nodes_to_cache, std::vector<uint32_t> &node_list);
 
     DISKANN_DLLEXPORT void cached_beam_search(const T *query, const uint64_t k_search, const uint64_t l_search,
                                               uint64_t *res_ids, float *res_dists, const uint64_t beam_width,
@@ -107,6 +143,25 @@ template <typename T, typename LabelT = uint32_t> class PQFlashIndex
 
     DISKANN_DLLEXPORT std::vector<std::uint8_t> get_pq_vector(std::uint64_t vid);
     DISKANN_DLLEXPORT uint64_t get_num_points();
+
+    //bs
+    DISKANN_DLLEXPORT void access_cache(uint32_t node_id, QueryStats *stats = nullptr);
+    DISKANN_DLLEXPORT void add_node_to_cache(uint32_t node_id, T* coords, std::pair<uint32_t, uint32_t*> nhood, QueryStats *stats = nullptr);
+
+    DISKANN_DLLEXPORT void initialize_lfu_cache();
+    DISKANN_DLLEXPORT void access_lfu_cache(uint32_t node_id, QueryStats *stats = nullptr);
+    DISKANN_DLLEXPORT void add_node_to_lfu(uint32_t node_id, T* coords, std::pair<uint32_t, uint32_t*> nhood, QueryStats *stats = nullptr);
+
+    DISKANN_DLLEXPORT void initialize_lru_cache();
+    DISKANN_DLLEXPORT void access_lru_cache(uint32_t node_id, QueryStats *stats = nullptr);
+    DISKANN_DLLEXPORT void add_node_to_lru(uint32_t node_id, T* coords, std::pair<uint32_t, uint32_t*> nhood, QueryStats *stats = nullptr);
+
+    DISKANN_DLLEXPORT void initialize_fifo_cache();
+    DISKANN_DLLEXPORT void access_fifo_cache(uint32_t node_id, QueryStats *stats = nullptr);
+    DISKANN_DLLEXPORT void add_node_to_fifo(uint32_t node_id, T* coords, std::pair<uint32_t, uint32_t*> nhood, QueryStats *stats = nullptr);
+
+    // Print graph information
+    void print_graph_info();
 
   protected:
     DISKANN_DLLEXPORT void use_medoids_data_as_centroids();
@@ -204,10 +259,6 @@ template <typename T, typename LabelT = uint32_t> class PQFlashIndex
     // centroids, we pick the medoid corresponding to the
     // closest centroid as the starting point of search
     float *_centroid_data = nullptr;
-
-    // nhood_cache; the uint32_t in nhood_Cache are offsets into nhood_cache_buf
-    unsigned *_nhood_cache_buf = nullptr;
-    tsl::robin_map<uint32_t, std::pair<uint32_t, uint32_t *>> _nhood_cache;
 
     // coord_cache; The T* in coord_cache are offsets into coord_cache_buf
     T *_coord_cache_buf = nullptr;

@@ -8,7 +8,7 @@
 #include "pq_scratch.h"
 #include "pq_flash_index.h"
 #include "cosine_similarity.h"
-
+#include <chrono>
 #ifdef _WINDOWS
 #include "windows_aligned_file_reader.h"
 #else
@@ -204,7 +204,7 @@ std::vector<bool> PQFlashIndex<T, LabelT>::read_nodes(const std::vector<uint32_t
     return retval;
 }
 
-template <typename T, typename LabelT> void PQFlashIndex<T, LabelT>::load_cache_list(std::vector<uint32_t> &node_list)
+template <typename T, typename LabelT> void PQFlashIndex<T, LabelT>::load_cache_list(std::vector<uint32_t> &node_list, std::string file_name)
 {
     diskann::cout << "Loading the cache list into memory.." << std::flush;
     size_t num_cached_nodes = node_list.size();
@@ -220,6 +220,12 @@ template <typename T, typename LabelT> void PQFlashIndex<T, LabelT>::load_cache_
 
     size_t BLOCK_SIZE = 8;
     size_t num_blocks = DIV_ROUND_UP(num_cached_nodes, BLOCK_SIZE);
+    
+    std::ofstream file;
+    if (file_name != "") {
+        file.open(file_name, std::ios::app);
+    }
+
     for (size_t block = 0; block < num_blocks; block++)
     {
         size_t start_idx = block * BLOCK_SIZE;
@@ -239,6 +245,7 @@ template <typename T, typename LabelT> void PQFlashIndex<T, LabelT>::load_cache_
         // issue the reads
         auto read_status = read_nodes(nodes_to_read, coord_buffers, nbr_buffers);
 
+
         // check for success and insert into the cache.
         for (size_t i = 0; i < read_status.size(); i++)
         {
@@ -246,10 +253,56 @@ template <typename T, typename LabelT> void PQFlashIndex<T, LabelT>::load_cache_
             {
                 _coord_cache.insert(std::make_pair(nodes_to_read[i], coord_buffers[i]));
                 _nhood_cache.insert(std::make_pair(nodes_to_read[i], nbr_buffers[i]));
+                if (file) {
+                    file << nodes_to_read[i] << "," << nbr_buffers[i].first << ",\"";
+                    for (uint32_t j = 0; j < nbr_buffers[i].first; j++) {
+                        file << nbr_buffers[i].second[j];
+                        if (j != nbr_buffers[i].first - 1) {
+                            file << ",";
+                        }
+                    }
+                    file << "\"" << std::endl; 
+                }
+            }
+        }
+            // 각 노드를 읽어서 캐시에 추가할 때 캐싱 기법에 따라 초기화
+        if (_cache_strategy == CacheStrategy::LFU) {
+            for (size_t i = 0; i < read_status.size(); i++) {
+                if (read_status[i]) {
+                    // LFU 빈도 초기화 - 노드 ID만 필요
+                    _entry_timestamp[nodes_to_read[i]] = _current_timestamp++;
+                    _cache_frequency[nodes_to_read[i]] = 1;
+                    _frequency_set.insert(std::make_tuple(1, _entry_timestamp[nodes_to_read[i]], nodes_to_read[i]));
+                }
+            }
+        }
+        else if (_cache_strategy == CacheStrategy::LRU) {
+            for (size_t i = 0; i < read_status.size(); i++) {
+                if (read_status[i]) {
+                    // LRU 리스트에 노드 ID 추가
+                    _lru_list.push_front(nodes_to_read[i]);
+                    _lru_map[nodes_to_read[i]] = _lru_list.begin();
+                }
+            }
+        }
+        else if (_cache_strategy == CacheStrategy::FIFO) {
+            for (size_t i = 0; i < read_status.size(); i++) {
+                if (read_status[i]) {
+                    // FIFO 큐에 노드 ID 추가
+                    _fifo_queue.push(nodes_to_read[i]);
+                }
             }
         }
     }
+    if (file) {
+        file.close();
+    }
     diskann::cout << "..done." << std::endl;
+}
+
+template <typename T, typename LabelT> void PQFlashIndex<T, LabelT>::load_cache_list(std::vector<uint32_t> &node_list)
+{
+    load_cache_list(node_list, "");
 }
 
 #ifdef EXEC_ENV_OLS
@@ -325,7 +378,7 @@ void PQFlashIndex<T, LabelT>::generate_cache_list_from_sample_queries(std::strin
         // run a search on the sample query with a random label (sampled from base label distribution), and it will
         // concurrently update the node_visit_counter to track most visited nodes. The last false is to not use the
         // "use_reorder_data" option which enables a final reranking if the disk index itself contains only PQ data.
-        cached_beam_search(samples + (i * sample_aligned_dim), 1, l_search, tmp_result_ids_64.data() + i,
+        cached_beam_search(samples + (i * sample_aligned_dim), nthreads, l_search, tmp_result_ids_64.data() + i,
                            tmp_result_dists.data() + i, beamwidth, filtered_search, label_for_search, false);
     }
 
@@ -340,6 +393,7 @@ void PQFlashIndex<T, LabelT>::generate_cache_list_from_sample_queries(std::strin
     for (uint64_t i = 0; i < num_nodes_to_cache; i++)
     {
         node_list.push_back(this->_node_visit_counter[i].first);
+        // std::cout << this->_node_visit_counter[i].first << " " << this->_node_visit_counter[i].second << std::endl;
     }
     this->_count_visited_nodes = false;
 
@@ -1235,6 +1289,242 @@ bool getNextCompletedRequest(std::shared_ptr<AlignedFileReader> &reader, IOConte
 #endif
 
 template <typename T, typename LabelT>
+void PQFlashIndex<T, LabelT>::access_cache(uint32_t node_id, QueryStats *stats) {
+    if (_cache_strategy == CacheStrategy::BFS || _cache_strategy == CacheStrategy::HOT || _cache_strategy == CacheStrategy::FIFO) {
+        auto start = std::chrono::high_resolution_clock::now();
+        if (stats != nullptr) {
+            auto end = std::chrono::high_resolution_clock::now();
+            auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+        }
+        return;
+    }
+    else if (_cache_strategy == CacheStrategy::LFU) {
+        access_lfu_cache(node_id, stats);
+    }
+    else if (_cache_strategy == CacheStrategy::LRU) {
+        access_lru_cache(node_id, stats);
+    }
+    return;
+}
+
+template <typename T, typename LabelT>
+void PQFlashIndex<T, LabelT>::add_node_to_cache(uint32_t node_id, T* coords, std::pair<uint32_t, uint32_t*> nhood, QueryStats *stats) {
+    if (_cache_strategy == CacheStrategy::BFS || _cache_strategy == CacheStrategy::HOT) {
+        auto start = std::chrono::high_resolution_clock::now();
+        if (stats != nullptr) {
+            auto end = std::chrono::high_resolution_clock::now();
+            auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+        }
+        return;
+    }
+    else if (_cache_strategy == CacheStrategy::LFU) {
+        add_node_to_lfu(node_id, coords, nhood, stats);
+    }
+    else if (_cache_strategy == CacheStrategy::LRU) {
+        add_node_to_lru(node_id, coords, nhood, stats);
+    }
+    else if (_cache_strategy == CacheStrategy::FIFO) {
+        add_node_to_fifo(node_id, coords, nhood, stats);
+    }
+    return;
+}
+
+
+
+template <typename T, typename LabelT>
+void PQFlashIndex<T, LabelT>::initialize_lfu_cache() {
+    // 모든 캐시 항목을 개별적으로 정리
+    for (auto& entry : _nhood_cache) {
+        delete[] entry.second.second;
+    }
+    
+    for (auto& entry : _coord_cache) {
+        delete[] entry.second;
+    }
+    
+    // 맵 자체 정리
+    _nhood_cache.clear();
+    _coord_cache.clear();
+    _cache_frequency.clear();
+    _frequency_set.clear();
+} 
+
+// 노드 접근 시 호출하는 함수
+template <typename T, typename LabelT>
+void PQFlashIndex<T, LabelT>::access_lfu_cache(uint32_t node_id, QueryStats *stats) {
+    auto start = std::chrono::high_resolution_clock::now();
+
+    // 기존 항목을 찾아서 업데이트
+    auto it = _frequency_set.find(std::make_tuple(_cache_frequency[node_id], _entry_timestamp[node_id], node_id));
+    if (it != _frequency_set.end()) {
+        // 기존 항목을 제거하고 새로운 값으로 업데이트
+        _frequency_set.erase(it);
+        _cache_frequency[node_id]++;
+        _entry_timestamp[node_id] = _current_timestamp++;
+        _frequency_set.insert(std::make_tuple(_cache_frequency[node_id], _entry_timestamp[node_id], node_id));
+    }
+
+    if (stats != nullptr) {
+        stats->cache_update_us += std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::high_resolution_clock::now() - start).count();
+    }
+}
+
+template <typename T, typename LabelT>
+void PQFlashIndex<T, LabelT>::add_node_to_lfu(uint32_t node_id, T* coords, std::pair<uint32_t, uint32_t*> nhood, QueryStats *stats) {
+    auto start = std::chrono::high_resolution_clock::now();
+
+    // 기존에 있던 노드는 먼저 제거하지 않고, 단순히 캐시가 가득 찼을 때만 제거 로직 적용
+    if (_nhood_cache.size() >= _max_cache_size) {
+        // 가장 적게 사용된 노드 찾기
+        if (!_frequency_set.empty()) {
+            auto it = _frequency_set.begin();
+            uint32_t evict_id = std::get<2>(*it);
+            
+            // 제거할 노드가 추가하려는 노드와 다른 경우에만 제거
+            if (evict_id != node_id) {
+                _frequency_set.erase(it);
+                _cache_frequency.erase(evict_id);
+                _entry_timestamp.erase(evict_id);
+                _coord_cache.erase(evict_id);
+                _nhood_cache.erase(evict_id);
+            }
+        }
+    }
+    // 새 노드 추가
+    _entry_timestamp[node_id] = _current_timestamp++;
+    _cache_frequency[node_id] = 1;
+    _frequency_set.insert(std::make_tuple(1, _entry_timestamp[node_id], node_id));
+
+    _coord_cache.insert(std::make_pair(node_id, coords));
+    _nhood_cache.insert(std::make_pair(node_id, nhood));
+
+    if (stats != nullptr) {
+        stats->cache_update_us += std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::high_resolution_clock::now() - start).count();
+    }
+}
+
+// LRU 캐시 구현
+template <typename T, typename LabelT>
+void PQFlashIndex<T, LabelT>::initialize_lru_cache() {
+    // 기존 캐시 데이터 정리
+    for (auto& entry : _nhood_cache) {
+        delete[] entry.second.second;
+    }
+    
+    for (auto& entry : _coord_cache) {
+        delete[] entry.second;
+    }
+    
+    // 맵과 리스트 초기화
+    _nhood_cache.clear();
+    _coord_cache.clear();
+    _lru_list.clear();
+    _lru_map.clear();
+}
+
+template <typename T, typename LabelT>
+void PQFlashIndex<T, LabelT>::access_lru_cache(uint32_t node_id, QueryStats *stats) {
+    auto start = std::chrono::high_resolution_clock::now();
+    // 이미 캐시에 있다는 것을 알고 있으므로 바로 업데이트
+    _lru_list.erase(_lru_map[node_id]);
+    _lru_list.push_front(node_id);
+    _lru_map[node_id] = _lru_list.begin();
+    if (stats != nullptr) {
+        stats->cache_update_us += std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::high_resolution_clock::now() - start).count();
+    }
+}
+
+template <typename T, typename LabelT>
+void PQFlashIndex<T, LabelT>::add_node_to_lru(uint32_t node_id, T* coords, std::pair<uint32_t, uint32_t*> nhood, QueryStats *stats) {
+    auto start = std::chrono::high_resolution_clock::now();
+    // 캐시가 가득 찼을 경우 가장 오래된 항목 제거
+    if (_nhood_cache.size() >= _max_cache_size) {
+        // std::cout << "lru cache full" << std::endl;
+        if (!_lru_list.empty()) {
+            uint32_t evict_id = _lru_list.back();
+            if (evict_id != node_id) {
+                _lru_list.pop_back();
+                _lru_map.erase(evict_id);
+                _coord_cache.erase(evict_id);
+                _nhood_cache.erase(evict_id);
+            }
+        }
+    }
+    // std::cout << "lru cache add node" << std::endl;
+    // std::cout << "lru cache size: " << _nhood_cache.size() << std::endl;
+    // 새 노드 추가
+    _coord_cache.insert(std::make_pair(node_id, coords));
+    _nhood_cache.insert(std::make_pair(node_id, nhood));
+    _lru_list.push_front(node_id);
+    _lru_map[node_id] = _lru_list.begin();
+
+    if (stats != nullptr) {
+        stats->cache_update_us += std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::high_resolution_clock::now() - start).count();
+    }
+}
+
+// FIFO 캐시 구현
+template <typename T, typename LabelT>
+void PQFlashIndex<T, LabelT>::initialize_fifo_cache() {
+    // 기존 캐시 데이터 정리
+    for (auto& entry : _nhood_cache) {
+        delete[] entry.second.second;
+    }
+    
+    for (auto& entry : _coord_cache) {
+        delete[] entry.second;
+    }
+    
+    // 맵과 큐 초기화
+    _nhood_cache.clear();
+    _coord_cache.clear();
+    while (!_fifo_queue.empty()) {
+        _fifo_queue.pop();
+    }
+}
+
+template <typename T, typename LabelT>
+void PQFlashIndex<T, LabelT>::access_fifo_cache(uint32_t node_id, QueryStats *stats) {
+    auto start = std::chrono::high_resolution_clock::now();
+    // FIFO는 접근 순서를 추적하지 않으므로 아무 작업도 하지 않음
+    if (stats != nullptr) {
+        stats->cache_update_us += std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::high_resolution_clock::now() - start).count();
+    }
+    return;
+}
+
+template <typename T, typename LabelT>
+void PQFlashIndex<T, LabelT>::add_node_to_fifo(uint32_t node_id, T* coords, std::pair<uint32_t, uint32_t*> nhood, QueryStats *stats) {
+    auto start = std::chrono::high_resolution_clock::now();
+    // 캐시가 가득 찼을 경우 가장 먼저 들어온 항목 제거
+    if (_nhood_cache.size() >= _max_cache_size) {
+        if (!_fifo_queue.empty()) {
+            uint32_t evict_id = _fifo_queue.front();
+            if (evict_id != node_id) {
+                _fifo_queue.pop();
+                _coord_cache.erase(evict_id);
+                _nhood_cache.erase(evict_id);
+            }
+        }
+    }
+
+    // 새 노드 추가
+    _coord_cache.insert(std::make_pair(node_id, coords));
+    _nhood_cache.insert(std::make_pair(node_id, nhood));
+    _fifo_queue.push(node_id);
+
+    if (stats != nullptr) {
+        stats->cache_update_us += std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::high_resolution_clock::now() - start).count();
+    }
+}
+
+template <typename T, typename LabelT>
 void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t k_search, const uint64_t l_search,
                                                  uint64_t *indices, float *distances, const uint64_t beam_width,
                                                  const bool use_reorder_data, QueryStats *stats)
@@ -1264,7 +1554,7 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                        use_reorder_data, stats);
 }
 
-// bs: beam search
+// bs: 진짜 beam search
 template <typename T, typename LabelT>
 void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t k_search, const uint64_t l_search,
                                                  uint64_t *indices, float *distances, const uint64_t beam_width,
@@ -1351,7 +1641,7 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
         diskann::aggregate_coords(ids, n_ids, this->data, this->_n_chunks, pq_coord_scratch);
         diskann::pq_dist_lookup(pq_coord_scratch, n_ids, this->_n_chunks, pq_dists, dists_out);
     };
-    Timer query_timer, io_timer, cpu_timer;
+    Timer query_timer, io_timer, cpu_timer, cache_update_timer;
 
     tsl::robin_set<uint64_t> &visited = query_scratch->visited;
     NeighborPriorityQueue &retset = query_scratch->retset;
@@ -1430,22 +1720,19 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
             auto nbr = retset.closest_unexpanded();
             num_seen++;
             auto iter = _nhood_cache.find(nbr.id);
-            if (iter != _nhood_cache.end())
-            {
+            if (iter != _nhood_cache.end()) {
+                access_cache(nbr.id, stats);
                 cached_nhoods.push_back(std::make_pair(nbr.id, iter->second));
-                if (stats != nullptr)
-                {
+                if (stats != nullptr) {
                     stats->n_cache_hits++;
                 }
             }
-            else
-            {
+            else {
                 frontier.push_back(nbr.id);
-                if (stats != nullptr)
-                {
+                if (stats != nullptr) {
                     stats->n_cache_misses++;
                 }
-            }
+            } 
             if (this->_count_visited_nodes)
             {
                 reinterpret_cast<std::atomic<uint32_t> &>(this->_node_visit_counter[nbr.id].second).fetch_add(1);
@@ -1581,7 +1868,6 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                 stats->cpu_us += (float)cpu_timer.elapsed();
             }
 
-            cpu_timer.reset();
             // process prefetch-ed nhood
             for (uint64_t m = 0; m < nnbrs; ++m)
             {
@@ -1606,10 +1892,14 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                 }
             }
 
-            if (stats != nullptr)
-            {
-                stats->cpu_us += (float)cpu_timer.elapsed();
-            }
+            T* node_coords = new T[_aligned_dim];
+            memcpy(node_coords, data_buf, _disk_bytes_per_point);
+            
+            uint32_t* node_nbrs_ = new uint32_t[nnbrs];  // _max_degree + 1 대신 실제 크기만큼만 할당
+            memcpy(node_nbrs_, node_buf + 1, nnbrs * sizeof(uint32_t));  // 첫 번째 요소에 크기를 저장할 필요 없음
+            
+            // 이미 읽은 node_buf와 data_buf를 활용하여 캐시에 추가
+            add_node_to_cache(frontier_nhood.first, node_coords, std::make_pair(nnbrs, node_nbrs_), stats);
         }
         if (stats != nullptr)
         {
@@ -1704,6 +1994,16 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
     {
         stats->total_us = (float)query_timer.elapsed();
     }
+    // std::cout << "cache size: " << _nhood_cache.size() << std::endl;
+    // if (stats != nullptr){
+    //     if (_nhood_cache.size() >= _max_cache_size && n_cache_full == 0) {
+    //         n_cache_full = 1;
+    //         std::cout << "cache full" << std::endl;
+    //     }
+    // }
+    // if (stats != nullptr) {
+    //     std::cout << "cache hit rate: " << (float)stats->n_cache_hits / (float)(stats->n_cache_hits + stats->n_cache_misses) << std::endl;
+    // }
 }
 
 // range search returns results of all neighbors within distance of range.
@@ -1788,6 +2088,90 @@ std::vector<std::uint8_t> PQFlashIndex<T, LabelT>::get_pq_vector(std::uint64_t v
 template <typename T, typename LabelT> std::uint64_t PQFlashIndex<T, LabelT>::get_num_points()
 {
     return _num_points;
+}
+
+template <typename T, typename LabelT>
+void PQFlashIndex<T, LabelT>::cache_random_nodes(uint64_t num_nodes_to_cache, std::vector<uint32_t> &node_list)
+{
+    std::random_device rng;
+    std::mt19937 urng(rng());
+
+    // 전체 노드 수의 10%를 넘지 않도록 제한
+    uint64_t tenp_nodes = (uint64_t)(std::round(this->_num_points * 0.1));
+    if (num_nodes_to_cache > tenp_nodes)
+    {
+        diskann::cout << "Reducing nodes to cache from: " << num_nodes_to_cache << " to: " << tenp_nodes
+                      << "(10 percent of total nodes:" << this->_num_points << ")" << std::endl;
+        num_nodes_to_cache = tenp_nodes == 0 ? 1 : tenp_nodes;
+    }
+    diskann::cout << "Caching " << num_nodes_to_cache << " random nodes..." << std::endl;
+
+    // 모든 노드 ID를 저장할 벡터 생성
+    std::vector<uint32_t> all_nodes;
+    all_nodes.reserve(this->_num_points);
+    for (uint32_t i = 0; i < this->_num_points; i++) {
+        all_nodes.push_back(i);
+    }
+
+    // 랜덤하게 섞기
+    std::shuffle(all_nodes.begin(), all_nodes.end(), urng);
+
+    // 캐시할 노드 선택
+    node_list.clear();
+    node_list.reserve(num_nodes_to_cache);
+    for (uint64_t i = 0; i < num_nodes_to_cache; i++) {
+        node_list.push_back(all_nodes[i]);
+    }
+
+    diskann::cout << "Random caching done. Selected " << node_list.size() << " nodes." << std::endl;
+}
+
+template <typename T, typename LabelT>
+void PQFlashIndex<T, LabelT>::print_graph_info() {
+    std::string file_name = "graph_info.csv";
+    std::ofstream file(file_name, std::ios::trunc);
+    file << "node_id,nbr_size,nbr_ids" << std::endl;
+    
+    // 노드 읽기를 위한 버퍼 할당
+    char* buf = nullptr;
+    auto num_sectors = _nnodes_per_sector > 0 ? 1 : DIV_ROUND_UP(_max_node_len, defaults::SECTOR_LEN);
+    alloc_aligned((void **)&buf, num_sectors * defaults::SECTOR_LEN, defaults::SECTOR_LEN);
+
+    // 각 노드에 대해 정보 출력
+    for (uint32_t node_id = 0; node_id < _num_points; node_id++) {
+        // 노드 읽기 요청 생성
+        AlignedRead read_req;
+        read_req.len = num_sectors * defaults::SECTOR_LEN;
+        read_req.buf = buf;
+        read_req.offset = get_node_sector(node_id) * defaults::SECTOR_LEN;
+        
+        std::vector<AlignedRead> read_reqs = {read_req};
+        
+        // 스레드 데이터 빌리고 읽기 실행
+        ScratchStoreManager<SSDThreadData<T>> manager(this->_thread_data);
+        auto this_thread_data = manager.scratch_space();
+        IOContext &ctx = this_thread_data->ctx;
+        reader->read(read_reqs, ctx);
+        
+        // 노드 정보 추출
+        char* node_buf = offset_to_node((char *)read_reqs[0].buf, node_id);
+        uint32_t* node_nhood = offset_to_node_nhood(node_buf);
+        uint32_t num_nbrs = *node_nhood;
+        uint32_t* nbrs = node_nhood + 1;
+        
+        // CSV 파일에 정보 저장
+        file << node_id << "," << num_nbrs << ",\"";
+        for (uint32_t i = 0; i < num_nbrs; i++) {
+            file << nbrs[i];
+            if (i < num_nbrs - 1) {
+                file << ",";
+            }
+        }
+        file << "\"" << std::endl;
+    }
+    
+    aligned_free(buf);
+    file.close();
 }
 
 // instantiations

@@ -36,6 +36,8 @@ struct QueryStats
     unsigned n_cache_hits = 0; // # cache_hits
     unsigned n_cache_misses = 0; // # cache_misses
     unsigned bs_hops = 0; // # hops
+
+    unsigned cache_update_us = 0;
 };
 
 template <typename T>

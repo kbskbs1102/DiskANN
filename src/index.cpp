@@ -734,6 +734,7 @@ template <typename T, typename TagT, typename LabelT> uint32_t Index<T, TagT, La
 {
     // REFACTOR TODO: This function does not support multi-threaded calculation of medoid.
     // Must revisit if perf is a concern.
+    // DiskANN/src/in_mem_data_store.cpp - calculate_medoid()
     return _data_store->calculate_medoid();
 }
 
@@ -1603,6 +1604,7 @@ void Index<T, TagT, LabelT>::build(const T *data, const size_t num_points_to_loa
     build_with_data_populated(tags);
 }
 
+//bs: 이게 진짜
 template <typename T, typename TagT, typename LabelT>
 void Index<T, TagT, LabelT>::build(const char *filename, const size_t num_points_to_load, const std::vector<TagT> &tags)
 {
@@ -1732,7 +1734,6 @@ void Index<T, TagT, LabelT>::build(const char *filename, const size_t num_points
     build(filename, num_points_to_load, tags);
 }
 
-//bs: 이게 진짜
 template <typename T, typename TagT, typename LabelT>
 void Index<T, TagT, LabelT>::build(const std::string &data_file, const size_t num_points_to_load,
                                    IndexFilterParams &filter_params)
@@ -2251,6 +2252,7 @@ template <typename T, typename TagT, typename LabelT> void Index<T, TagT, LabelT
     {
         throw ANNException("ERROR: Can not pick a frozen point since nd=0", -1, __FUNCSIG__, __FILE__, __LINE__);
     }
+    // DiskANN/src/in_mem_data_store.cpp - calculate_medoid()
     size_t res = calculate_entry_point();
 
     // REFACTOR PQ: Not sure if we should do this for both stores.

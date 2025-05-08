@@ -53,7 +53,8 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
                       const uint32_t num_threads, const uint32_t recall_at, const uint32_t beamwidth,
                       const uint32_t num_nodes_to_cache, const uint32_t search_io_limit,
                       const std::vector<uint32_t> &Lvec, const float fail_if_recall_below,
-                      const std::vector<std::string> &query_filters, const bool use_reorder_data = false)
+                      const std::vector<std::string> &query_filters, const bool use_reorder_data = false,
+                      const std::string &cache_strategy = "bfs")
 {
     diskann::cout << "Search parameters: #threads: " << num_threads << ", ";
     if (beamwidth <= 0)
@@ -120,23 +121,71 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
     }
 
     std::vector<uint32_t> node_list;
-    diskann::cout << "Caching " << num_nodes_to_cache << " nodes around medoid(s)" << std::endl;
+    diskann::cout << "Caching " << num_nodes_to_cache << " nodes using strategy: " << cache_strategy << std::endl;
     
-    // 캐싱하는 부분
     auto s = std::chrono::high_resolution_clock::now();
-    _pFlashIndex->cache_bfs_levels(num_nodes_to_cache, node_list);
-    if (num_nodes_to_cache > 0)
-        _pFlashIndex->generate_cache_list_from_sample_queries(warmup_query_file, 15, 6, num_nodes_to_cache,
-        num_threads, node_list);
-    _pFlashIndex->load_cache_list(node_list);
+    // 캐싱 전략 선택
+    if (cache_strategy == "bfs") {
+        // 캐싱 모델 1: BFS 기반 캐싱
+        _pFlashIndex->_cache_strategy = diskann::PQFlashIndex<T, LabelT>::CacheStrategy::BFS;
+        _pFlashIndex->cache_bfs_levels(num_nodes_to_cache, node_list);
+    } 
+    else if (cache_strategy == "hot") {
+        // 캐싱 모델 2: 자주 방문되는 노드 캐싱
+        _pFlashIndex->_cache_strategy = diskann::PQFlashIndex<T, LabelT>::CacheStrategy::HOT;
+        if (num_nodes_to_cache > 0)
+            _pFlashIndex->generate_cache_list_from_sample_queries(warmup_query_file, 15, 6, num_nodes_to_cache,
+                                                            num_threads, node_list);
+    } 
+    else if (cache_strategy == "lfu") {
+        // 캐싱 모델 3: LFU cache
+        _pFlashIndex->_cache_strategy = diskann::PQFlashIndex<T, LabelT>::CacheStrategy::LFU;
+        _pFlashIndex->initialize_lfu_cache();
+        // _pFlashIndex->cache_bfs_levels(num_nodes_to_cache, node_list);
+        _pFlashIndex->_max_cache_size = num_nodes_to_cache;
+    }
+    else if (cache_strategy == "lru") {
+        // 캐싱 모델 4: LRU cache
+        _pFlashIndex->_cache_strategy = diskann::PQFlashIndex<T, LabelT>::CacheStrategy::LRU;
+        _pFlashIndex->initialize_lru_cache();
+        // _pFlashIndex->cache_bfs_levels(num_nodes_to_cache, node_list);
+        _pFlashIndex->_max_cache_size = num_nodes_to_cache;
+    }
+    else if (cache_strategy == "fifo") {
+        // 캐싱 모델 5: FIFO cache
+        _pFlashIndex->_cache_strategy = diskann::PQFlashIndex<T, LabelT>::CacheStrategy::FIFO;
+        _pFlashIndex->initialize_fifo_cache();
+        // _pFlashIndex->cache_bfs_levels(num_nodes_to_cache, node_list);
+        _pFlashIndex->_max_cache_size = num_nodes_to_cache;
+    }
+    else if (cache_strategy == "rand") {
+        // 캐싱 모델 6: 랜덤 캐싱
+        _pFlashIndex->_cache_strategy = diskann::PQFlashIndex<T, LabelT>::CacheStrategy::RANDOM;
+        _pFlashIndex->cache_random_nodes(num_nodes_to_cache, node_list);
+    }
+    else {
+        diskann::cout << "Unknown caching strategy: " << cache_strategy << ". Using default bfs strategy." << std::endl;
+        _pFlashIndex->cache_bfs_levels(num_nodes_to_cache, node_list);
+    } 
+
+    std::string file_name = "cache_data_" + cache_strategy + ".csv";
+    std::ofstream file(file_name, std::ios::trunc);
+    file << "node_id,nbr_size,nbr_ids" << std::endl;
+
+    auto m = std::chrono::high_resolution_clock::now();
+    _pFlashIndex->load_cache_list(node_list, file_name);
     auto e = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> diff = e - s;
-    double caching_time = diff.count();
+    std::chrono::duration<double> cache_construction_time = m - s;
+    std::chrono::duration<double> cache_loading_time = e - m;
+    double caching_time = cache_construction_time.count() + cache_loading_time.count();
+    diskann::cout << "Cache construction time: " << cache_construction_time.count() << " s" << std::endl;
+    diskann::cout << "Cache loading time: " << cache_loading_time.count() << " s" << std::endl;
     diskann::cout << "Caching time: " << caching_time << " s" << std::endl;   
+    diskann::cout << "cache size: " << _pFlashIndex->_nhood_cache.size() << std::endl;
     // 캐싱 끝
     node_list.clear();
     node_list.shrink_to_fit();
-
+    _pFlashIndex->print_graph_info();
     omp_set_num_threads(num_threads);
 
     uint64_t warmup_L = 20;
@@ -185,17 +234,19 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
     diskann::cout.precision(2);
 
     std::string recall_string = "Recall@" + std::to_string(recall_at);
-    diskann::cout << std::setw(6) << "L" << std::setw(12) << "Beamwidth" << std::setw(16) << "QPS" << std::setw(16)
-                  << "Mean Latency" << std::setw(16) << "99.9 Latency" << std::setw(16) << "Mean IOs" << std::setw(16)
-                  << "Mean IO (us)" << std::setw(16) << "CPU (s)" << std::setw(16) << "Cache Hit Rate" << std::setw(16) << "Mean BS Hops" << std::setw(16) << "Mean Hit Cnt" ;
+    diskann::cout << std::setw(6) << "L" << std::setw(12) << "Beamwidth" << std::setw(12) << "QPS" << std::setw(16)
+                  << "Mean Latency" << std::setw(16) << "99.9 Latency" << std::setw(12) << "Mean IOs" << std::setw(16)
+                  << "Mean IO (us)" << std::setw(12) << "CPU (us)" << std::setw(16) << "Cache Hit Rate" << std::setw(16)
+                  << "Mean BS Hops" << std::setw(16) << "Mean Hit Cnt" << std::setw(16) << "Mean Cache Update (us)";
     if (calc_recall_flag)
     {
-        diskann::cout << std::setw(16) << recall_string << std::endl;
+        diskann::cout << std::setw(12) << recall_string << std::endl;
     }
     else
         diskann::cout << std::endl;
     diskann::cout << "=================================================================="
                      "================================================================="
+                     "================================ "
                   << std::endl;
 
     std::vector<std::vector<uint32_t>> query_result_ids(Lvec.size());
@@ -261,6 +312,7 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
         }
         auto e = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double> diff = e - s;
+            
         double qps = (1.0 * query_num) / (1.0 * diff.count());
 
         diskann::convert_types<uint64_t, uint32_t>(query_result_ids_64.data(), query_result_ids[test_id].data(),
@@ -275,7 +327,7 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
         auto mean_ios = diskann::get_mean_stats<uint32_t>(stats, query_num,
                                                           [](const diskann::QueryStats &stats) { return stats.n_ios; });
 
-        auto mean_cpuus = diskann::get_mean_stats<float>(stats, query_num,
+        auto mean_cpu_us = diskann::get_mean_stats<float>(stats, query_num,
                                                          [](const diskann::QueryStats &stats) { return stats.cpu_us; });
 
         auto mean_io_us = diskann::get_mean_stats<float>(stats, query_num,
@@ -292,6 +344,9 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
         
         auto mean_bs_hops = diskann::get_mean_stats<uint32_t>(stats, query_num,
                                                               [](const diskann::QueryStats &stats) { return stats.bs_hops; });
+
+        auto mean_cache_update_us = diskann::get_mean_stats<float>(stats, query_num,
+                                                              [](const diskann::QueryStats &stats) { return stats.cache_update_us; });
         double recall = 0;
         if (calc_recall_flag)
         {
@@ -300,18 +355,33 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
             best_recall = std::max(recall, best_recall);
         }
 
-        diskann::cout << std::setw(6) << L << std::setw(12) << optimized_beamwidth << std::setw(16) << qps
-                      << std::setw(16) << mean_latency << std::setw(16) << latency_999 << std::setw(16) << mean_ios
-                      << std::setw(16) << mean_io_us << std::setw(16) << mean_cpuus << std::setw(16) << mean_cache_hit_rate << std::setw(16) << mean_bs_hops << std::setw(16) << mean_cache_hit_cnt;
+        diskann::cout << std::setw(6) << L << std::setw(12) << optimized_beamwidth << std::setw(12) << qps
+                      << std::setw(16) << mean_latency << std::setw(16) << latency_999 << std::setw(12) << mean_ios
+                      << std::setw(16) << mean_io_us << std::setw(12) << mean_cpu_us << std::setw(16) << mean_cache_hit_rate 
+                      << std::setw(16) << mean_hops << std::setw(16) << mean_cache_hit_cnt << std::setw(16) << mean_cache_update_us;
         if (calc_recall_flag)
         {
-            diskann::cout << std::setw(16) << recall << std::endl;
+            diskann::cout << std::setw(12) << recall << std::endl;
         }
         else
             diskann::cout << std::endl;
         delete[] stats;
     }
 
+    // if (cache_strategy == "lfu") {
+    //     std::cout << "cache size: " << _pFlashIndex->_cache_frequency.size() << std::endl;
+    //     for (auto &pair : _pFlashIndex->_cache_frequency) {
+    //         std::cout << pair.first << " " << pair.second << std::endl;
+    //     }
+    //     std::cout << "frequency set size: " << _pFlashIndex->_frequency_set.size() << std::endl;
+    //     for (auto &pair : _pFlashIndex->_frequency_set) {
+    //         std::cout << pair.first << " " << pair.second << std::endl;
+    //     }
+    // }
+    // for (auto &node : _pFlashIndex->_nhood_cache) {
+    //     std::cout << "node id: " << node.first << std::endl;
+    // }
+    std::cout << "nhood_cache size: " << _pFlashIndex->_nhood_cache.size() << std::endl;
     diskann::cout << "Done searching. Now saving results " << std::endl;
     uint64_t test_id = 0;
     for (auto L : Lvec)
@@ -340,7 +410,7 @@ int main(int argc, char **argv)
     std::vector<uint32_t> Lvec;
     bool use_reorder_data = false;
     float fail_if_recall_below = 0.0f;
-
+    std::string cache_strategy = "entry_neighbor";
     po::options_description desc{
         program_options_utils::make_program_description("search_disk_index", "Searches on-disk DiskANN indexes")};
     try
@@ -394,6 +464,9 @@ int main(int argc, char **argv)
         optional_configs.add_options()("fail_if_recall_below",
                                        po::value<float>(&fail_if_recall_below)->default_value(0.0f),
                                        program_options_utils::FAIL_IF_RECALL_BELOW);
+        optional_configs.add_options()("cache_strategy",
+                               po::value<std::string>(&cache_strategy)->default_value("bfs"),
+                               "Caching strategy: 'bfs' (entry-neighbor), 'hot' (frequently visited nodes), or 'lfu' (LFU cache). Default: bfs");  
 
         // Merge required and optional parameters
         desc.add(required_configs).add(optional_configs);
@@ -473,15 +546,15 @@ int main(int argc, char **argv)
             if (data_type == std::string("float"))
                 return search_disk_index<float, uint16_t>(
                     metric, index_path_prefix, result_path_prefix, query_file, gt_file, num_threads, K, W,
-                    num_nodes_to_cache, search_io_limit, Lvec, fail_if_recall_below, query_filters, use_reorder_data);
+                    num_nodes_to_cache, search_io_limit, Lvec, fail_if_recall_below, query_filters, use_reorder_data, cache_strategy);
             else if (data_type == std::string("int8"))
                 return search_disk_index<int8_t, uint16_t>(
                     metric, index_path_prefix, result_path_prefix, query_file, gt_file, num_threads, K, W,
-                    num_nodes_to_cache, search_io_limit, Lvec, fail_if_recall_below, query_filters, use_reorder_data);
+                    num_nodes_to_cache, search_io_limit, Lvec, fail_if_recall_below, query_filters, use_reorder_data, cache_strategy);
             else if (data_type == std::string("uint8"))
                 return search_disk_index<uint8_t, uint16_t>(
                     metric, index_path_prefix, result_path_prefix, query_file, gt_file, num_threads, K, W,
-                    num_nodes_to_cache, search_io_limit, Lvec, fail_if_recall_below, query_filters, use_reorder_data);
+                    num_nodes_to_cache, search_io_limit, Lvec, fail_if_recall_below, query_filters, use_reorder_data, cache_strategy);
             else
             {
                 std::cerr << "Unsupported data type. Use float or int8 or uint8" << std::endl;
@@ -493,15 +566,15 @@ int main(int argc, char **argv)
             if (data_type == std::string("float"))
                 return search_disk_index<float>(metric, index_path_prefix, result_path_prefix, query_file, gt_file,
                                                 num_threads, K, W, num_nodes_to_cache, search_io_limit, Lvec,
-                                                fail_if_recall_below, query_filters, use_reorder_data);
+                                                fail_if_recall_below, query_filters, use_reorder_data, cache_strategy);
             else if (data_type == std::string("int8"))
                 return search_disk_index<int8_t>(metric, index_path_prefix, result_path_prefix, query_file, gt_file,
                                                  num_threads, K, W, num_nodes_to_cache, search_io_limit, Lvec,
-                                                 fail_if_recall_below, query_filters, use_reorder_data);
+                                                 fail_if_recall_below, query_filters, use_reorder_data, cache_strategy);
             else if (data_type == std::string("uint8"))
                 return search_disk_index<uint8_t>(metric, index_path_prefix, result_path_prefix, query_file, gt_file,
                                                   num_threads, K, W, num_nodes_to_cache, search_io_limit, Lvec,
-                                                  fail_if_recall_below, query_filters, use_reorder_data);
+                                                  fail_if_recall_below, query_filters, use_reorder_data, cache_strategy);
             else
             {
                 std::cerr << "Unsupported data type. Use float or int8 or uint8" << std::endl;
